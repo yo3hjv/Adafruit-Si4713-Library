@@ -1,9 +1,9 @@
-# Adafruit-Si4713-Library [![Build Status](https://github.com/adafruit/Adafruit-Si4713-Library/workflows/Arduino%20Library%20CI/badge.svg)](https://github.com/adafruit/Adafruit-Si4713-Library/actions)[![Documentation](https://github.com/adafruit/ci-arduino/blob/master/assets/doxygen_badge.svg)](http://adafruit.github.io/Adafruit-Si4713-Library/html/index.html)
+# Adafruit-Si4713-Library 
 
 
-<a href="https://www.adafruit.com/product/1958"><img src="assets/board.jpg?raw=true" width="500px"></a>
 
-This is the Adafruit FM Transmitter with RDS/RBDS Breakout - Si4713 library
+This is the Adafruit FM Transmitter with RDS/RBDS Breakout - Si4713 library with some important add-ons and fixes.
+ For a detailed description of what was added, please read CHANGELOG.md
 
 Tested and works great with the Adafruit Si4713 Breakout Board 
 * http://www.adafruit.com/products/1958
@@ -16,4 +16,5 @@ Limor Fried/Ladyada (Adafruit Industries).
 BSD license, check license.txt for more information
 All text above must be included in any redistribution
 
-To install, use the Arduino Library Manager and search for "Adafruit Si4713 Library" and install the library.
+To use it, put .cpp and .h files in the same folder as the .ino main code file.
+You will still need to install Adafruit BusIO library!
