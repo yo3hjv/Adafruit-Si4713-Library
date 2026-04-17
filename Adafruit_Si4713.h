@@ -20,11 +20,27 @@
  *  BSD license, all text above must be included in any redistribution
  */
 
-#include <Adafruit_I2CDevice.h>
+/*
+ * Fixed improper initialisation of the SI4713 circuit
+ * By Adrian YO3HJV @April 2026
+ *
+ * Changes vs original Adafruit library:
+ *
+ * Include guard:
+ *   Added #pragma once to prevent multiple-inclusion issues when the header
+ *   is used alongside other Adafruit libraries in a multi-file sketch.
+ *
+ * Debug macro name:
+ *   Renamed SI471X_CMD_DEBUG to SI4713_CMD_DEBUG. The original name contained
+ *   a typo (SI471X instead of SI4713), so uncommenting it in the header had
+ *   no effect because the .cpp implementation checked for SI4713_CMD_DEBUG.
+ */
+#pragma once
 
+#include <Adafruit_I2CDevice.h>
 #include "Arduino.h"
 
-// #define SI471X_CMD_DEBUG
+// #define SI4713_CMD_DEBUG
 #define SI4710_ADDR0 0x11      ///< if SEN is low
 #define SI4710_ADDR1 0x63      ///< if SEN is high, default!
 #define SI4710_STATUS_CTS 0x80 ///< read status
@@ -119,11 +135,13 @@
   0x2302 ///< Configures the duration which the input audio level must be below
          ///< the low threshold in order to detect a low audio condition.
 #define SI4713_PROP_TX_AQS_LEVEL_HIGH \
-  0x2303 ///< Configures high audio input level detection threshold. This
-         ///< threshold can be used to detect activity on the incoming audio.
+  0x2303 ///< Configures high audio input level detection threshold.
 #define SI4713_PROP_TX_AQS_DURATION_HIGH \
   0x2304 ///< Configures the duration which the input audio level must be above
          ///< the high threshold in order to detect a high audio condition.
+// Corrected-name aliases (original defines use AQS typo instead of ASQ)
+#define SI4713_PROP_TX_ASQ_LEVEL_HIGH    SI4713_PROP_TX_AQS_LEVEL_HIGH
+#define SI4713_PROP_TX_ASQ_DURATION_HIGH SI4713_PROP_TX_AQS_DURATION_HIGH
 #define SI4713_PROP_TX_RDS_INTERRUPT_SOURCE \
   0x2C00 ///< Configure RDS interrupt sources. Default is none selected.
 #define SI4713_PROP_TX_RDS_PI 0x2C01 ///< Sets transmit RDS program identifier.
@@ -165,12 +183,33 @@ class Adafruit_Si4713 {
   void readTuneMeasure(uint16_t freq);
   void setTXpower(uint8_t pwr, uint8_t antcap = 0);
   void readASQ(void);
-  void setProperty(uint16_t p, uint16_t v);
+  void     setProperty(uint16_t p, uint16_t v);
+  uint16_t getProperty(uint16_t p);
+
+  // Power management
+  void powerDown();
+  void powerUpDigital(uint16_t sampleRate = 44100);
+
+  // Audio compander (limiter / AGC)
+  // mode: 0=off, 0x01=limiter only, 0x02=compander(ADRC) only, 0x03=limiter+compander
+  // threshold: dBFS, -40..0  |  attack: 0-4  |  release: 0-9  |  gain: 0-20 dB
+  // limiterRelease: limiter-only release time index 0-9 (default 102 = 5.01 ms per datasheet)
+  void setAudioCompander(uint8_t mode, int8_t threshold = -40,
+                         uint8_t attack = 0, uint8_t release = 4,
+                         uint8_t gain = 15, uint8_t limiterRelease = 102);
+
+  // Audio Signal Quality thresholds (levels in dBFS, -70..0; durations in ms)
+  void setASQThresholds(int8_t levelLow, uint16_t durLow,
+                        int8_t levelHigh, uint16_t durHigh);
+
+  // Scan FM band for quietest channel; returns frequency in 10 kHz units
+  uint16_t scanNoise(uint16_t startFreq, uint16_t endFreq, uint8_t step = 10);
 
   // RDS stuff
   void beginRDS(uint16_t programID = 0xADAF);
   void setRDSstation(const char* s);
   void setRDSbuffer(const char* s);
+  void setRDSpi(uint16_t pi);
 
   uint16_t currFreq;  ///< current frequency
   uint8_t currdBuV,   ///< current BuV

@@ -22,9 +22,48 @@
  *
  * 	BSD (see license.txt)
  *
- * 	@section  HISTORY
- *
  *     v1.0 - First release
+ */
+ 
+/*
+ * Fixed improper initialisation of the SI4713 circuit
+ * By Adrian YO3HJV @April 2026
+ *
+ * Changes vs original Adafruit library:
+ *
+ * begin():
+ *   Moved reset() call to BEFORE i2c_dev->begin() (I2C address scan).
+ *   The original code scanned the I2C bus before resetting the chip; if the
+ *   chip was in an undefined power-on state it would not ACK its address,
+ *   causing begin() to return false and requiring multiple MCU resets.
+ *
+ * reset():
+ *   Added delay(100) after NRST de-assertion (final digitalWrite HIGH).
+ *   Without this delay, powerUp() was issued before the chip completed its
+ *   internal boot sequence, causing intermittent I2C failures on fast MCUs
+ *   such as ESP32. Required by Si4713 datasheet power-up timing (sec. 8).
+ *
+ * sendCommand():
+ *   Added a 5-second timeout to the CTS polling loop. The original loop was
+ *   infinite; if the chip failed to assert CTS the MCU would block
+ *   permanently. On timeout a diagnostic message is printed to Serial.
+ *
+ * getRev():
+ *   Chip revision details (part number, firmware, patch, component, chip rev)
+ *   are now always printed to Serial unconditionally. The original code
+ *   guarded all output behind #ifdef SI4713_CMD_DEBUG, making startup
+ *   verification impossible in normal builds. A firmware field duplication
+ *   and missing component version field present in the original debug block
+ *   are also corrected.
+ *   Per Si4713 datasheet, FWMAJOR, FWMINOR, CMPMAJOR and CMPMINOR are ASCII
+ *   characters (like CHIPREV). Fixed display from Serial.print(..., HEX) to
+ *   Serial.write() so firmware shows as e.g. "2.0" instead of "32.30".
+ *
+ * powerUp():
+ *   Corrected the inline comment for setProperty(SI4713_PROP_TX_ACOMP_ENABLE,
+ *   0x0): the original comment read "turn on limiter and AGC" which is the
+ *   opposite of what value 0x0 does (disables the audio compander entirely).
+ *   Documented correct values: 0x02 = limiter only, 0x03 = limiter + AGC.
  */
 
 #include "Adafruit_Si4713.h"
@@ -52,10 +91,11 @@ bool Adafruit_Si4713::begin(uint8_t addr, TwoWire* theWire) {
   if (i2c_dev)
     delete i2c_dev;
   i2c_dev = new Adafruit_I2CDevice(addr, theWire);
+
+  reset(); // reset BEFORE I2C scan: chip must be booted to ACK its address
+
   if (!i2c_dev->begin())
     return false;
-
-  reset();
 
   powerUp();
 
@@ -78,6 +118,7 @@ void Adafruit_Si4713::reset() {
     digitalWrite(_rst, LOW);
     delay(10);
     digitalWrite(_rst, HIGH);
+    delay(100); // wait for chip internal boot after NRST de-assertion (datasheet req.)
   }
 }
 
@@ -106,6 +147,23 @@ void Adafruit_Si4713::setProperty(uint16_t property, uint16_t value) {
 }
 
 /*!
+ *    @brief  Read a chip property value over I2C using GET_PROPERTY (0x13).
+ *    @param  property  property address
+ *    @return 16-bit property value read from chip, or 0 on timeout
+ */
+uint16_t Adafruit_Si4713::getProperty(uint16_t property) {
+  _i2ccommand[0] = SI4710_CMD_GET_PROPERTY;
+  _i2ccommand[1] = 0;
+  _i2ccommand[2] = property >> 8;
+  _i2ccommand[3] = property & 0xFF;
+  sendCommand(4);
+
+  uint8_t resp[4];
+  i2c_dev->read(resp, 4);
+  return ((uint16_t)resp[2] << 8) | resp[3];
+}
+
+/*!
  *    @brief  Send command stored in _i2ccommand to chip.
  *    @param  len
  *            length of command that will be send
@@ -113,10 +171,16 @@ void Adafruit_Si4713::setProperty(uint16_t property, uint16_t value) {
 void Adafruit_Si4713::sendCommand(uint8_t len) {
   // Send command
   i2c_dev->write(_i2ccommand, len);
-  // Wait for status CTS bit
+  // Wait for status CTS bit with 5-second timeout
   uint8_t status = 0;
-  while (!(status & SI4710_STATUS_CTS))
+  uint32_t t = millis();
+  while (!(status & SI4710_STATUS_CTS)) {
+    if (millis() - t > 5000) {
+      Serial.println("SI4713: sendCommand timeout - CTS not received!");
+      return;
+    }
     i2c_dev->read(&status, 1);
+  }
 }
 
 /*!
@@ -334,7 +398,7 @@ void Adafruit_Si4713::powerUp() {
   setProperty(SI4713_PROP_TX_ACOMP_GAIN, 10);  // max gain?
   // setProperty(SI4713_PROP_TX_ACOMP_ENABLE, 0x02); // turn on limiter, but no
   // dynamic ranging
-  setProperty(SI4713_PROP_TX_ACOMP_ENABLE, 0x0); // turn on limiter and AGC
+  setProperty(SI4713_PROP_TX_ACOMP_ENABLE, 0x0); // audio compander disabled (0x02=limiter only, 0x03=limiter+AGC)
 }
 
 /*!
@@ -347,29 +411,33 @@ uint8_t Adafruit_Si4713::getRev() {
   _i2ccommand[1] = 0;
   sendCommand(2);
 
-  uint8_t pn, resp[9];
+  uint8_t resp[9];
   i2c_dev->read(resp, 9);
-  pn = resp[1];
-
-#ifdef SI4713_CMD_DEBUG
-  uint8_t fw, patch, cmp, chiprev;
-  fw = (uint16_t(resp[2]) << 8) | resp[3];
-  patch = (uint16_t(resp[4]) << 8) | resp[5];
-  cmp = (uint16_t(resp[6]) << 8) | resp[7];
-  chiprev = resp[8];
+  uint8_t  pn      = resp[1];
+  uint8_t  fwmaj   = resp[2]; // ASCII character per datasheet
+  uint8_t  fwmin   = resp[3]; // ASCII character per datasheet
+  uint16_t patch   = ((uint16_t)resp[4] << 8) | resp[5];
+  uint8_t  cmpmaj  = resp[6]; // ASCII character per datasheet
+  uint8_t  cmpmin  = resp[7]; // ASCII character per datasheet
+  uint8_t  chiprev = resp[8]; // ASCII character per datasheet
 
   Serial.print("Part # Si47");
-  Serial.print(pn);
-  Serial.print("-");
-  Serial.println(fw, HEX);
-  Serial.print("Firmware 0x");
-  Serial.println(fw, HEX);
-  Serial.print("Patch 0x");
+  Serial.println(pn);
+  Serial.print("Firmware : ");
+  Serial.write(fwmaj);
+  Serial.print(".");
+  Serial.write(fwmin);
+  Serial.println();
+  Serial.print("Patch    : 0x");
   Serial.println(patch, HEX);
-  Serial.print("Chip rev ");
+  Serial.print("Component: ");
+  Serial.write(cmpmaj);
+  Serial.print(".");
+  Serial.write(cmpmin);
+  Serial.println();
+  Serial.print("Chip Rev : ");
   Serial.write(chiprev);
   Serial.println();
-#endif
 
   return pn;
 }
@@ -400,4 +468,103 @@ void Adafruit_Si4713::setGPIO(uint8_t x) {
   _i2ccommand[0] = SI4710_CMD_GPO_SET;
   _i2ccommand[1] = x;
   sendCommand(2);
+}
+
+/*!
+ *    @brief  Powers down the Si4713 (POWER_DOWN command 0x11).
+ *            Call begin() again to restart the chip.
+ */
+void Adafruit_Si4713::powerDown() {
+  _i2ccommand[0] = SI4710_CMD_POWER_DOWN;
+  _i2ccommand[1] = 0;
+  sendCommand(2);
+}
+
+/*!
+ *    @brief  Powers up the Si4713 in digital audio input mode (I2S).
+ *            Equivalent to powerUp() but with ARG2 = 0xD0 instead of 0x50.
+ *    @param  sampleRate  I2S sample rate in Hz (e.g. 44100). Default 44100.
+ */
+void Adafruit_Si4713::powerUpDigital(uint16_t sampleRate) {
+  _i2ccommand[0] = SI4710_CMD_POWER_UP;
+  _i2ccommand[1] = 0x12; // XOSCEN=1, FM TX
+  _i2ccommand[2] = 0xD0; // digital audio input mode
+  sendCommand(3);
+
+  setProperty(SI4713_PROP_REFCLK_FREQ, 32768);
+  setProperty(SI4713_PROP_DIGITAL_INPUT_FORMAT, 0x0000); // I2S, 16-bit, stereo
+  setProperty(SI4713_PROP_DIGITAL_INPUT_SAMPLE_RATE, sampleRate);
+  setProperty(SI4713_PROP_TX_PREEMPHASIS, 0);
+  setProperty(SI4713_PROP_TX_ACOMP_GAIN, 10);
+  setProperty(SI4713_PROP_TX_ACOMP_ENABLE, 0x0);
+}
+
+/*!
+ *    @brief  Configures the audio dynamic range control (compander).
+ *    @param  mode           0=disabled, 0x01=limiter only, 0x02=compander(ADRC) only, 0x03=both
+ *    @param  threshold      Input level threshold in dBFS (-40..0). Default -40.
+ *    @param  attack         Attack time index 0-4 (0.5/1/1.5/2/2.5 ms). Default 0.
+ *    @param  release        Compander release time index 0-9 (100..8000 ms). Default 4.
+ *    @param  gain           Compander gain 0-20 dB. Default 15.
+ *    @param  limiterRelease Limiter-specific release time (TX_LIMITER_RELEASE_TIME).
+ *                           Default 102 = 5.01 ms per datasheet.
+ */
+void Adafruit_Si4713::setAudioCompander(uint8_t mode, int8_t threshold,
+                                        uint8_t attack, uint8_t release,
+                                        uint8_t gain, uint8_t limiterRelease) {
+  setProperty(SI4713_PROP_TX_ACOMP_THRESHOLD,    (uint16_t)(int16_t)threshold);
+  setProperty(SI4713_PROP_TX_ATTACK_TIME,         attack);
+  setProperty(SI4713_PROP_TX_RELEASE_TIME,        release);
+  setProperty(SI4713_PROP_TX_ACOMP_GAIN,          gain);
+  setProperty(SI4713_PROP_TX_LIMITER_RELEASE_TIME, limiterRelease);
+  setProperty(SI4713_PROP_TX_ACOMP_ENABLE,        mode); // enable last
+}
+
+/*!
+ *    @brief  Configures Audio Signal Quality (ASQ) interrupt thresholds.
+ *            After calling this, readASQ() will report low/high audio events.
+ *    @param  levelLow   Low level threshold in dBFS (-70..0). Silence detect.
+ *    @param  durLow     Duration below low threshold to trigger event (ms).
+ *    @param  levelHigh  High level threshold in dBFS (-70..0). Overdrive detect.
+ *    @param  durHigh    Duration above high threshold to trigger event (ms).
+ */
+void Adafruit_Si4713::setASQThresholds(int8_t levelLow, uint16_t durLow,
+                                       int8_t levelHigh, uint16_t durHigh) {
+  setProperty(SI4713_PROP_TX_ASQ_INTERRUPT_SOURCE, 0x03); // enable both interrupts
+  setProperty(SI4713_PROP_TX_ASQ_LEVEL_LOW,        (uint16_t)(int16_t)levelLow);
+  setProperty(SI4713_PROP_TX_ASQ_DURATION_LOW,     durLow);
+  setProperty(SI4713_PROP_TX_ASQ_LEVEL_HIGH,       (uint16_t)(int16_t)levelHigh);
+  setProperty(SI4713_PROP_TX_ASQ_DURATION_HIGH,    durHigh);
+}
+
+/*!
+ *    @brief  Scans a range of FM frequencies and returns the one with the
+ *            lowest measured noise level (best candidate for transmission).
+ *    @param  startFreq  Start of scan range in 10 kHz units (e.g. 8750).
+ *    @param  endFreq    End of scan range in 10 kHz units (e.g. 10800).
+ *    @param  step       Step size in 10 kHz units. Default 10 (= 100 kHz).
+ *    @return Frequency with lowest noise, in 10 kHz units.
+ */
+uint16_t Adafruit_Si4713::scanNoise(uint16_t startFreq, uint16_t endFreq,
+                                    uint8_t step) {
+  uint16_t bestFreq  = startFreq;
+  uint8_t  bestNoise = 0xFF;
+
+  for (uint16_t f = startFreq; f <= endFreq; f += step) {
+    readTuneMeasure(f);
+    readTuneStatus();
+    if (currNoiseLevel < bestNoise) {
+      bestNoise = currNoiseLevel;
+      bestFreq  = f;
+    }
+  }
+  return bestFreq;
+}
+
+/*!
+ *    @brief  Sets the RDS Programme Identifier (PI) code standalone.
+ *    @param  pi  16-bit PI code (e.g. 0xADAF for Adafruit default).
+ */
+void Adafruit_Si4713::setRDSpi(uint16_t pi) {
+  setProperty(SI4713_PROP_TX_RDS_PI, pi);
 }
